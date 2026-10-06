@@ -28,6 +28,26 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def parse_field_time(raw: Any) -> datetime:
+    """Parse an on-scene timestamp into an aware datetime (naive values are UTC)."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise DomainError("事件缺少现场时间 occurred_at")
+    text = raw.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise DomainError("现场时间 occurred_at 不是有效的 ISO 8601 时间") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     radius = 6371.0088
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -153,23 +173,45 @@ class MaritimeSARService:
                     merged_at TEXT,
                     summary TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS offline_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER NOT NULL REFERENCES offline_batches(id),
+                    client_batch_id TEXT NOT NULL,
+                    client_event_id TEXT NOT NULL UNIQUE,
+                    event_type TEXT NOT NULL,
+                    occurred_at TEXT,
+                    payload TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    conflict_reason TEXT NOT NULL DEFAULT '',
+                    reference_id INTEGER,
+                    idempotent INTEGER NOT NULL DEFAULT 0,
+                    resolved_by TEXT NOT NULL DEFAULT '',
+                    resolved_note TEXT NOT NULL DEFAULT '',
+                    processed_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS timeline (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     incident_id INTEGER REFERENCES incidents(id),
                     actor TEXT NOT NULL,
                     action TEXT NOT NULL,
                     details TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    occurred_at TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_clues_incident ON clues(incident_id, recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_timeline_incident ON timeline(incident_id, id);
+                CREATE INDEX IF NOT EXISTS idx_offline_events_batch ON offline_events(batch_id, occurred_at);
                 """
             )
+            timeline_cols = {row["name"] for row in conn.execute("PRAGMA table_info(timeline)")}
+            if "occurred_at" not in timeline_cols:
+                conn.execute("ALTER TABLE timeline ADD COLUMN occurred_at TEXT")
 
-    def _audit(self, conn: sqlite3.Connection, incident_id: int | None, actor: str, action: str, details: dict[str, Any]) -> None:
+    def _audit(self, conn: sqlite3.Connection, incident_id: int | None, actor: str, action: str,
+               details: dict[str, Any], occurred_at: str | None = None) -> None:
         conn.execute(
-            "INSERT INTO timeline(incident_id,actor,action,details,created_at) VALUES(?,?,?,?,?)",
-            (incident_id, actor, action, json_dump(details), utcnow()),
+            "INSERT INTO timeline(incident_id,actor,action,details,created_at,occurred_at) VALUES(?,?,?,?,?,?)",
+            (incident_id, actor, action, json_dump(details), utcnow(), occurred_at),
         )
 
     def create_incident(self, actor: str, role: str, code: str, vessel_name: str,
@@ -479,74 +521,408 @@ class MaritimeSARService:
             self._audit(conn, incident_id, actor, "incident.closed", {"outcome": outcome})
             return dict(conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone())
 
+    # -- offline replay -----------------------------------------------------
+
+    OFFLINE_TYPES = {"clue", "timeline", "assignment", "withdraw", "transfer"}
+
+    def _replay_assignment(self, conn: sqlite3.Connection, event: dict[str, Any],
+                           occurred: str, force: bool = False) -> tuple[int, dict[str, Any]]:
+        area_id = int(event["area_id"])
+        asset_id = int(event["asset_id"])
+        area = conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone()
+        asset = conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+        if not area or not asset:
+            raise DomainError("搜索区域或资源不存在", 404)
+        incident = conn.execute("SELECT * FROM incidents WHERE id=?", (area["incident_id"],)).fetchone()
+        if not incident:
+            raise DomainError("事件不存在", 404)
+        # Idempotent: this exact allocation already holds.
+        if area["assigned_asset_id"] == asset_id and area["status"] == "assigned":
+            return area_id, {"idempotent": True}
+        # A stale asset version means the shore side touched the same resource;
+        # that is the conflict the coordinator must adjudicate.
+        expected = event.get("expected_asset_version")
+        if expected is not None and int(expected) != asset["version"] and not force:
+            raise DomainError("岸端已修改该资源（版本 %s，现场基于版本 %s）" % (asset["version"], int(expected)), 409)
+        reason: str | None = None
+        if area["assigned_asset_id"] is not None:
+            reason = "搜索区域已经分配给其他资源"
+        elif incident["status"] in CLOSED_INCIDENT:
+            reason = "事件已结束，不能占用资源"
+        elif asset["status"] != "available":
+            reason = "资源已被占用或撤回"
+        if reason is None and incident["sea_state"] > asset["max_sea_state"]:
+            reason = "海况超出资源能力"
+        if reason is None:
+            capabilities = json.loads(asset["capabilities"])
+            if area["kind"] not in capabilities:
+                reason = "资源不具备该搜索区域能力"
+        if reason is None:
+            distance = haversine_km(asset["latitude"], asset["longitude"], area["center_lat"], area["center_lon"])
+            if distance > asset["range_km"]:
+                reason = "搜索区域超出资源航程"
+        if reason and not force:
+            raise DomainError(reason, 409)
+        now = utcnow()
+        if force:
+            # Adjudication in favour of the field operation: release any prior
+            # occupancy that would otherwise leave two areas on one asset.
+            prior_areas = conn.execute(
+                "SELECT id FROM search_areas WHERE assigned_asset_id=? AND id<>? AND status IN ('assigned','active')",
+                (asset_id, area_id),
+            ).fetchall()
+            for prior in prior_areas:
+                conn.execute(
+                    "UPDATE search_areas SET assigned_asset_id=NULL,status='planned',version=version+1,updated_at=? WHERE id=?",
+                    (now, prior["id"]),
+                )
+            other_asset = area["assigned_asset_id"]
+            if other_asset is not None and other_asset != asset_id:
+                conn.execute(
+                    "UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?",
+                    (now, other_asset),
+                )
+        conn.execute(
+            "UPDATE assets SET status='assigned',version=version+1,updated_at=? WHERE id=? AND status='available'",
+            (now, asset_id),
+        )
+        conn.execute(
+            "UPDATE search_areas SET assigned_asset_id=?,status='assigned',version=version+1,updated_at=? WHERE id=?",
+            (asset_id, now, area_id),
+        )
+        self._audit(conn, area["incident_id"], event.get("actor") or "offline", "area.assigned",
+                    {"area_id": area_id, "asset_id": asset_id, "source": "offline", "forced": force}, occurred)
+        return area_id, {"idempotent": False, "forced": force}
+
+    def _replay_withdraw(self, conn: sqlite3.Connection, event: dict[str, Any],
+                         occurred: str, force: bool = False) -> tuple[int, dict[str, Any]]:
+        asset_id = int(event["asset_id"])
+        reason_text = str(event.get("reason", "离线撤回")).strip() or "离线撤回"
+        asset = conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+        if not asset:
+            raise DomainError("资源不存在", 404)
+        if asset["status"] == "available":
+            return asset_id, {"idempotent": True}
+        incident_id: int | None = None
+        areas = conn.execute(
+            "SELECT id,incident_id FROM search_areas WHERE assigned_asset_id=? AND status IN ('assigned','active')",
+            (asset_id,),
+        ).fetchall()
+        conflict = None
+        expected = event.get("expected_asset_version")
+        if expected is not None and int(expected) != asset["version"] and not force:
+            conflict = "岸端已修改该资源（版本 %s，现场基于版本 %s）" % (asset["version"], int(expected))
+        if conflict:
+            raise DomainError(conflict, 409)
+        now = utcnow()
+        for area in areas:
+            incident_id = area["incident_id"]
+            conn.execute(
+                "UPDATE search_areas SET assigned_asset_id=NULL,status='planned',version=version+1,updated_at=? WHERE id=?",
+                (now, area["id"]),
+            )
+            self._audit(conn, area["incident_id"], event.get("actor") or "offline", "area.unassigned",
+                        {"area_id": area["id"], "reason": reason_text, "source": "offline", "forced": force}, occurred)
+        conn.execute("UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?", (now, asset_id))
+        self._audit(conn, incident_id, event.get("actor") or "offline", "asset.withdrawn",
+                    {"asset_id": asset_id, "reason": reason_text, "source": "offline", "forced": force}, occurred)
+        return asset_id, {"idempotent": False, "forced": force}
+
+    def _replay_transfer(self, conn: sqlite3.Connection, event: dict[str, Any],
+                         occurred: str, force: bool = False) -> tuple[int, dict[str, Any]]:
+        incident_id = int(event["incident_id"])
+        new_org = str(event.get("new_org", "")).strip()
+        if not new_org:
+            raise DomainError("接收机构不能为空")
+        incident = conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
+        if not incident:
+            raise DomainError("事件不存在", 404)
+        if incident["status"] in CLOSED_INCIDENT:
+            if not force:
+                raise DomainError("事件已结束，不能移交", 409)
+        if incident["lead_org"] == new_org:
+            return incident_id, {"idempotent": True}
+        expected = event.get("expected_version")
+        if expected is not None and int(expected) != incident["version"] and not force:
+            raise DomainError("岸端已修改事件（版本 %s，现场基于版本 %s）" % (incident["version"], int(expected)), 409)
+        from_org = incident["lead_org"]
+        now = utcnow()
+        conn.execute(
+            "UPDATE incidents SET lead_org=?,version=version+1,updated_at=? WHERE id=?",
+            (new_org, now, incident_id),
+        )
+        self._audit(conn, incident_id, event.get("actor") or "offline", "incident.transferred",
+                    {"from": from_org, "to": new_org, "source": "offline", "forced": force,
+                     "note": str(event.get("note", "")).strip()}, occurred)
+        return incident_id, {"idempotent": False, "forced": force}
+
+    def _replay_clue(self, conn: sqlite3.Connection, event: dict[str, Any],
+                     occurred: str, force: bool = False) -> tuple[int | None, dict[str, Any]]:
+        event_id = str(event["client_event_id"]).strip()
+        existing_clue = conn.execute("SELECT id FROM clues WHERE client_event_id=?", (event_id,)).fetchone()
+        if existing_clue:
+            return existing_clue["id"], {"idempotent": True}
+        incident_id = int(event["incident_id"])
+        lat, lon = validate_position(event["latitude"], event["longitude"])
+        confidence = float(event["confidence"])
+        if not 0 <= confidence <= 1:
+            raise DomainError("置信度应在 0 到 1 之间")
+        incident = conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
+        if not incident:
+            raise DomainError("事件不存在", 404)
+        if incident["status"] in CLOSED_INCIDENT and not force:
+            raise DomainError("已结束事件不能新增线索", 409)
+        area_id = event.get("area_id")
+        if area_id is not None and not conn.execute(
+            "SELECT 1 FROM search_areas WHERE id=? AND incident_id=?", (area_id, incident_id)
+        ).fetchone():
+            raise DomainError("搜索区域不属于该事件", 409)
+        distance = haversine_km(incident["latitude"], incident["longitude"], lat, lon)
+        status = "unverified" if distance <= incident["uncertainty_km"] * 3 else "invalid"
+        cur = conn.execute(
+            """INSERT INTO clues(incident_id,area_id,client_event_id,latitude,longitude,confidence,source,status,
+               distance_from_incident_km,reporter,details,recorded_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (incident_id, area_id, event_id, lat, lon, confidence,
+             str(event.get("source", "offline")).strip(), status, distance,
+             str(event.get("actor", "offline")).strip(), str(event.get("details", "")).strip(), occurred),
+        )
+        self._audit(conn, incident_id, str(event.get("actor", "offline")).strip(), "clue.recorded",
+                    {"clue_id": cur.lastrowid, "status": status, "event_id": event_id,
+                     "source": "offline", "forced": force}, occurred)
+        return cur.lastrowid, {"idempotent": False, "forced": force}
+
+    def _replay_timeline(self, conn: sqlite3.Connection, event: dict[str, Any], occurred: str) -> tuple[None, dict[str, Any]]:
+        incident_id = int(event["incident_id"])
+        if not conn.execute("SELECT 1 FROM incidents WHERE id=?", (incident_id,)).fetchone():
+            raise DomainError("事件不存在", 404)
+        details = event.get("details", {})
+        if not isinstance(details, dict):
+            raise DomainError("时间线详情必须是对象")
+        self._audit(conn, incident_id, str(event.get("actor", "offline")).strip(),
+                    str(event.get("action", "offline.note")).strip() or "offline.note",
+                    {**details, "source": "offline"}, occurred)
+        return None, {"idempotent": False}
+
+    def _replay_one(self, conn: sqlite3.Connection, event: dict[str, Any], occurred: str,
+                    force: bool = False) -> tuple[int | None, dict[str, Any]]:
+        event_type = event.get("type")
+        if event_type == "assignment":
+            return self._replay_assignment(conn, event, occurred, force)
+        if event_type == "withdraw":
+            return self._replay_withdraw(conn, event, occurred, force)
+        if event_type == "transfer":
+            return self._replay_transfer(conn, event, occurred, force)
+        if event_type == "clue":
+            return self._replay_clue(conn, event, occurred, force)
+        if event_type == "timeline":
+            return self._replay_timeline(conn, event, occurred)
+        raise DomainError("不支持的离线事件类型：%r" % (event_type,))
+
     def merge_offline_batch(self, actor: str, role: str, client_batch_id: str,
                             events: list[dict[str, Any]]) -> dict[str, Any]:
         actor = clean_actor(actor)
         require_role(role, {"operator", "field", "coordinator"}, "合并离线记录")
-        batch_id = client_batch_id.strip()
-        if not batch_id or not isinstance(events, list):
+        batch_id_ref = client_batch_id.strip()
+        if not batch_id_ref or not isinstance(events, list):
             raise DomainError("批次编号和事件列表不能为空")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            existing = conn.execute("SELECT * FROM offline_batches WHERE client_batch_id=?", (batch_id,)).fetchone()
+            existing = conn.execute("SELECT * FROM offline_batches WHERE client_batch_id=?", (batch_id_ref,)).fetchone()
             if existing:
-                return {"batch_id": batch_id, "idempotent": True, "status": existing["status"], "summary": json.loads(existing["summary"])}
-            results = []
-            for event in events:
-                event_id = str(event.get("client_event_id", "")).strip()
+                # Retry of a fully or partially uploaded batch is idempotent:
+                # already-stored events are never replayed twice.
+                stored = conn.execute(
+                    "SELECT * FROM offline_events WHERE batch_id=? ORDER BY occurred_at IS NULL, occurred_at, client_event_id",
+                    (existing["id"],),
+                ).fetchall()
+                if not stored:
+                    summary = json.loads(existing["summary"])
+                else:
+                    summary = self._batch_summary(stored)
+                    conn.execute("UPDATE offline_batches SET summary=?, status=? WHERE id=?",
+                                 (json.dumps(summary, ensure_ascii=False),
+                                  "conflict" if summary["conflicts"] else "merged", existing["id"]))
+                return {"batch_id": batch_id_ref, "idempotent": True,
+                        "status": "conflict" if summary["conflicts"] else "merged", "summary": summary}
+
+            # Parse + structurally validate every event, and order by on-scene time.
+            ordered: list[tuple[datetime, str, dict[str, Any]]] = []
+            structural: list[tuple[str, str, dict[str, Any]]] = []
+            for raw in events:
+                if not isinstance(raw, dict):
+                    structural.append(("", "离线事件必须是对象", {}))
+                    continue
+                event_id = str(raw.get("client_event_id", "")).strip()
+                if not event_id:
+                    structural.append(("", "离线事件缺少 client_event_id", raw))
+                    continue
+                if raw.get("type") not in self.OFFLINE_TYPES:
+                    structural.append((event_id, "不支持的离线事件类型：%r" % raw.get("type"), raw))
+                    continue
                 try:
-                    if not event_id:
-                        raise DomainError("离线事件缺少 client_event_id")
-                    if event.get("type") == "clue":
-                        existing_clue = conn.execute("SELECT id FROM clues WHERE client_event_id=?", (event_id,)).fetchone()
-                        if existing_clue:
-                            results.append({"client_event_id": event_id, "status": "merged", "record_id": existing_clue["id"], "idempotent": True})
-                            continue
-                        incident_id = int(event["incident_id"])
-                        lat, lon = validate_position(event["latitude"], event["longitude"])
-                        confidence = float(event["confidence"])
-                        if not 0 <= confidence <= 1:
-                            raise DomainError("置信度应在 0 到 1 之间")
-                        incident = conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
-                        if not incident:
-                            raise DomainError("事件不存在", 404)
-                        if incident["status"] in CLOSED_INCIDENT:
-                            raise DomainError("已结束事件不能新增线索", 409)
-                        area_id = event.get("area_id")
-                        if area_id is not None and not conn.execute(
-                            "SELECT 1 FROM search_areas WHERE id=? AND incident_id=?", (area_id, incident_id)
-                        ).fetchone():
-                            raise DomainError("搜索区域不属于该事件", 409)
-                        distance = haversine_km(incident["latitude"], incident["longitude"], lat, lon)
-                        status = "unverified" if distance <= incident["uncertainty_km"] * 3 else "invalid"
-                        cur = conn.execute(
-                            """INSERT INTO clues(incident_id,area_id,client_event_id,latitude,longitude,confidence,source,status,
-                               distance_from_incident_km,reporter,details,recorded_at)
-                               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (incident_id, area_id, event_id, lat, lon, confidence,
-                             str(event.get("source", "offline")).strip(), status, distance, actor,
-                             str(event.get("details", "")).strip(), utcnow()),
-                        )
-                        self._audit(conn, incident_id, actor, "clue.recorded", {"clue_id": cur.lastrowid, "status": status, "event_id": event_id})
-                        results.append({"client_event_id": event_id, "status": "merged", "record_id": cur.lastrowid})
-                    elif event.get("type") == "timeline":
-                        incident_id = int(event["incident_id"])
-                        if not conn.execute("SELECT 1 FROM incidents WHERE id=?", (incident_id,)).fetchone():
-                            raise DomainError("事件不存在", 404)
-                        self._audit(conn, incident_id, actor, event.get("action", "offline.note"), event.get("details", {}))
-                        results.append({"client_event_id": event_id, "status": "merged", "record_id": None})
-                    else:
-                        raise DomainError("不支持的离线事件类型")
-                except (DomainError, KeyError, TypeError, ValueError) as exc:
-                    results.append({"client_event_id": event_id, "status": "rejected", "error": str(exc)})
-            summary = {"accepted": sum(1 for item in results if item["status"] == "merged"), "rejected": sum(1 for item in results if item["status"] == "rejected"), "events": results}
+                    when = parse_field_time(raw.get("occurred_at"))
+                except DomainError as exc:
+                    structural.append((event_id, str(exc), raw))
+                    continue
+                ordered.append((when, event_id, raw))
+            ordered.sort(key=lambda item: (item[0], item[1]))
+
             now = utcnow()
-            conn.execute(
+            batch_cur = conn.execute(
                 "INSERT INTO offline_batches(client_batch_id,actor,status,received_at,merged_at,summary) VALUES(?,?,?,?,?,?)",
-                (batch_id, actor, "merged", now, now, json_dump(summary)),
+                (batch_id_ref, actor, "merging", now, None, "{}"),
             )
-            self._audit(conn, None, actor, "offline.batch_merged", {"batch_id": batch_id, **{k: summary[k] for k in ("accepted", "rejected")}})
-            return {"batch_id": batch_id, "idempotent": False, "status": "merged", "summary": summary}
+            batch_pk = int(batch_cur.lastrowid)
+            results: list[dict[str, Any]] = []
+
+            def store(event_id: str, event_type: str, when: str | None, payload: dict[str, Any],
+                      status: str, conflict_reason: str, reference_id: int | None,
+                      idempotent: bool) -> dict[str, Any]:
+                conn.execute(
+                    """INSERT INTO offline_events(batch_id,client_batch_id,client_event_id,event_type,occurred_at,
+                       payload,status,conflict_reason,reference_id,idempotent,processed_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (batch_pk, batch_id_ref, event_id, event_type, when, json.dumps(payload, ensure_ascii=False),
+                     status, conflict_reason, reference_id, 1 if idempotent else 0, utcnow()),
+                )
+                item = {"client_event_id": event_id, "type": event_type, "occurred_at": when,
+                        "status": status, "idempotent": bool(idempotent)}
+                if conflict_reason:
+                    item["error"] = conflict_reason
+                if reference_id is not None:
+                    item["record_id"] = reference_id
+                results.append(item)
+                return item
+
+            # Permanently malformed events never become conflicts.
+            for seq, (event_id, error, payload) in enumerate(structural):
+                store(event_id or "__invalid__%d-%d" % (batch_pk, seq + 1),
+                      str(payload.get("type", "unknown")) if payload else "unknown",
+                      None, payload if isinstance(payload, dict) else {}, "rejected", error, None, False)
+
+            # Replay in field-time order; a conflicting event is parked untouched.
+            for when, event_id, raw in ordered:
+                occurred = iso(when)
+                dup = conn.execute("SELECT * FROM offline_events WHERE client_event_id=?", (event_id,)).fetchone()
+                if dup:
+                    # Same event already delivered in another batch: never replay twice.
+                    item = {"client_event_id": event_id, "type": raw["type"], "occurred_at": occurred,
+                            "status": dup["status"], "idempotent": True,
+                            "record_id": dup["reference_id"]}
+                    if dup["conflict_reason"]:
+                        item["error"] = dup["conflict_reason"]
+                    results.append(item)
+                    continue
+                try:
+                    reference_id, meta = self._replay_one(conn, raw, occurred)
+                    store(event_id, raw["type"], occurred, raw, "merged", "",
+                          reference_id, bool(meta.get("idempotent")))
+                except DomainError as exc:
+                    # Conflict (409/404-style domain collision) waits for adjudication;
+                    # it is not replayed against later state automatically.
+                    store(event_id, raw["type"], occurred, raw, "conflict", str(exc), None, False)
+
+            summary = self._batch_summary(results)
+            status = "conflict" if summary["conflicts"] else "merged"
+            conn.execute(
+                "UPDATE offline_batches SET status=?,merged_at=?,summary=? WHERE id=?",
+                (status, utcnow(), json.dumps(summary, ensure_ascii=False), batch_pk),
+            )
+            self._audit(conn, None, actor, "offline.batch_merged",
+                        {"batch_id": batch_id_ref, "accepted": summary["accepted"],
+                         "conflicts": summary["conflicts"], "rejected": summary["rejected"]})
+            return {"batch_id": batch_id_ref, "idempotent": False, "status": status, "summary": summary}
+
+    EVENT_ORDER = "occurred_at IS NULL, occurred_at, client_event_id"
+
+    @staticmethod
+    def _batch_summary(events: list[Any]) -> dict[str, Any]:
+        items: list[dict[str, Any]] = []
+        for row in events:
+            if isinstance(row, dict):
+                items.append(row)
+            else:
+                items.append({
+                    "client_event_id": row["client_event_id"],
+                    "type": row["event_type"],
+                    "occurred_at": row["occurred_at"],
+                    "status": row["status"],
+                    "error": row["conflict_reason"],
+                    "record_id": row["reference_id"],
+                    "idempotent": bool(row["idempotent"]),
+                })
+        items.sort(key=lambda item: (item.get("occurred_at") is None,
+                                     item.get("occurred_at") or "", item.get("client_event_id") or ""))
+        return {
+            "accepted": sum(1 for item in items if item["status"] == "merged"),
+            "conflicts": sum(1 for item in items if item["status"] == "conflict"),
+            "rejected": sum(1 for item in items if item["status"] == "rejected"),
+            "events": items,
+        }
+
+    def list_offline_batches(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            batches = [dict(r) for r in conn.execute(
+                "SELECT * FROM offline_batches ORDER BY id DESC").fetchall()]
+            events = [dict(r) for r in conn.execute(
+                "SELECT * FROM offline_events ORDER BY occurred_at IS NULL, occurred_at, client_event_id").fetchall()]
+        grouped: dict[int, list[dict[str, Any]]] = {}
+        for event in events:
+            event["payload"] = json.loads(event["payload"])
+            event["idempotent"] = bool(event["idempotent"])
+            grouped.setdefault(event["batch_id"], []).append(event)
+        for batch in batches:
+            batch["summary"] = json.loads(batch["summary"]) if batch["summary"] else {}
+            batch["events"] = grouped.get(batch["id"], [])
+        return batches
+
+    def resolve_offline_event(self, actor: str, role: str, client_event_id: str,
+                              decision: str, note: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator"}, "裁决离线冲突")
+        if decision not in {"apply", "discard"}:
+            raise DomainError("裁决结论必须是 apply 或 discard")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM offline_events WHERE client_event_id=?", (client_event_id,)).fetchone()
+            if not row:
+                raise DomainError("离线事件不存在", 404)
+            if row["status"] != "conflict":
+                raise DomainError("该事件不是待裁决冲突项", 409)
+            payload = json.loads(row["payload"])
+            payload["actor"] = payload.get("actor") or row["client_batch_id"]
+            occurred = row["occurred_at"] or utcnow()
+            if decision == "discard":
+                conn.execute(
+                    "UPDATE offline_events SET status='discarded',resolved_by=?,resolved_note=?,processed_at=? WHERE id=?",
+                    (actor, note.strip(), utcnow(), row["id"]),
+                )
+                self._audit(conn, payload.get("incident_id"), actor, "offline.conflict_discarded",
+                            {"event_id": client_event_id, "type": row["event_type"], "note": note.strip()}, occurred)
+                result = {"client_event_id": client_event_id, "status": "discarded"}
+            else:
+                reference_id, meta = self._replay_one(conn, payload, occurred, force=True)
+                conn.execute(
+                    "UPDATE offline_events SET status='merged',conflict_reason='',reference_id=?,"
+                    "resolved_by=?,resolved_note=?,processed_at=? WHERE id=?",
+                    (reference_id, actor, note.strip(), utcnow(), row["id"]),
+                )
+                self._audit(conn, payload.get("incident_id"), actor, "offline.conflict_applied",
+                            {"event_id": client_event_id, "type": row["event_type"], "note": note.strip()}, occurred)
+                result = {"client_event_id": client_event_id, "status": "merged",
+                          "record_id": reference_id, "forced": bool(meta.get("forced"))}
+            remaining = conn.execute(
+                "SELECT * FROM offline_events WHERE batch_id=? ORDER BY occurred_at IS NULL, occurred_at, client_event_id",
+                (row["batch_id"],),
+            ).fetchall()
+            summary = self._batch_summary(remaining)
+            conn.execute(
+                "UPDATE offline_batches SET status=?,summary=?,merged_at=? WHERE id=?",
+                ("conflict" if summary["conflicts"] else "merged",
+                 json.dumps(summary, ensure_ascii=False), utcnow(), row["batch_id"]),
+            )
+            return result
 
     def state(self, actor: str = "", role: str = "viewer") -> dict[str, Any]:
         with self.connect() as conn:
@@ -554,12 +930,21 @@ class MaritimeSARService:
             areas = [dict(r) for r in conn.execute("SELECT * FROM search_areas ORDER BY priority,id").fetchall()]
             clues = [dict(r) for r in conn.execute("SELECT * FROM clues ORDER BY id DESC LIMIT 200").fetchall()]
             assets = [dict(r) for r in conn.execute("SELECT * FROM assets ORDER BY id").fetchall()]
-            timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 300").fetchall()]
-        return {"incidents": incidents, "assets": assets, "search_areas": areas, "clues": clues, "timeline": timeline}
+            timeline = [dict(r) for r in conn.execute(
+                "SELECT * FROM (SELECT * FROM timeline ORDER BY id DESC LIMIT 300) "
+                "ORDER BY COALESCE(occurred_at, created_at), id"
+            ).fetchall()]
+        # Latest batches first for the console; replay order lives inside each summary.
+        batches = self.list_offline_batches()
+        return {"incidents": incidents, "assets": assets, "search_areas": areas, "clues": clues,
+                "timeline": timeline, "offline_batches": batches}
 
     def incident_timeline(self, incident_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
-            rows = conn.execute("SELECT * FROM timeline WHERE incident_id=? ORDER BY id", (incident_id,)).fetchall()
+            rows = conn.execute(
+                "SELECT * FROM timeline WHERE incident_id=? ORDER BY COALESCE(occurred_at, created_at), id",
+                (incident_id,),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def seed_demo(self) -> dict[str, Any]:
@@ -621,6 +1006,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             if path == "/api/state":
                 self._send(200, self.service.state(*self._actor()))
                 return
+            if path == "/api/offline/batches":
+                self._send(200, {"batches": self.service.list_offline_batches()})
+                return
             if path.startswith("/api/incidents/") and path.endswith("/timeline"):
                 incident_id = int(path.split("/")[3])
                 self._send(200, {"timeline": self.service.incident_timeline(incident_id)})
@@ -655,6 +1043,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.close_incident(actor, role, **data)
             elif path == "/api/offline/batch":
                 result = self.service.merge_offline_batch(actor, role, **data)
+            elif path == "/api/offline/resolve":
+                result = self.service.resolve_offline_event(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)

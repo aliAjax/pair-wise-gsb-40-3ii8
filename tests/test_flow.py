@@ -34,6 +34,7 @@ class MaritimeSARFlowTest(unittest.TestCase):
         batch = self.service.merge_offline_batch(
             "field1", "field", "batch-1",
             [{"type": "clue", "client_event_id": "off-1", "incident_id": self.incident["id"],
+              "occurred_at": "2026-10-06T03:10:00Z",
               "latitude": 31.11, "longitude": 122.11, "confidence": 0.7, "source": "radio"}],
         )
         self.assertEqual(1, batch["summary"]["accepted"])

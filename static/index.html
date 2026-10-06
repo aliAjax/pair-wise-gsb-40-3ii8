@@ -1,8 +1,60 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>海上搜救协调</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1100px;margin:30px auto;padding:0 20px;color:#17324d}table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #cbd8e3;padding:8px;text-align:left}th{background:#edf5fb}code{background:#f2f5f7;padding:2px 5px}.card{background:#f7fbfe;border-left:5px solid #2784c7;padding:12px 16px}</style>
-<h1>海上搜救协调</h1><div class="card">页面读取实时状态。业务写入通过 README 中的 JSON API 完成，并需要 <code>X-User</code>、<code>X-Role</code>。</div>
+<style>
+body{font:15px/1.6 system-ui,sans-serif;max-width:1100px;margin:30px auto;padding:0 20px;color:#17324d}
+table{border-collapse:collapse;width:100%;margin:16px 0}
+th,td{border:1px solid #cbd8e3;padding:8px;text-align:left;vertical-align:top}
+th{background:#edf5fb}
+code{background:#f2f5f7;padding:2px 5px}
+.card{background:#f7fbfe;border-left:5px solid #2784c7;padding:12px 16px}
+.batch{border:1px solid #cbd8e3;border-radius:6px;padding:12px 16px;margin:12px 0}
+.batch.conflict{border-left:6px solid #d97706}
+.batch.merged{border-left:6px solid #16a34a}
+.tag{display:inline-block;border-radius:10px;padding:1px 10px;font-size:12px;color:#fff;margin-right:6px}
+.tag.merged{background:#16a34a}.tag.conflict{background:#d97706}
+.tag.rejected{background:#b91c1c}.tag.discarded{background:#6b7280}
+.meta{color:#5b7186;font-size:13px}
+button{border:0;border-radius:4px;padding:5px 12px;margin-right:6px;cursor:pointer;color:#fff}
+.apply{background:#16a34a}.discard{background:#6b7280}
+</style>
+<h1>海上搜救协调</h1><div class="card">离线批次按<b>现场时间</b>重放：成功项立即写入资源状态、搜索区域与时间线；冲突项原样保留，等待协调员裁决。</div>
 <h2>遇险事件</h2><table id="incidents"><thead><tr><th>编号</th><th>船名</th><th>状态</th><th>海况</th><th>负责机构</th><th>版本</th></tr></thead><tbody></tbody></table>
-<h2>资源</h2><table id="assets"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>航程</th></tr></thead><tbody></tbody></table>
+<h2>资源</h2><table id="assets"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>航程</th><th>版本</th></tr></thead><tbody></tbody></table>
 <h2>搜索区域</h2><table id="areas"><thead><tr><th>编号</th><th>事件</th><th>状态</th><th>优先级</th><th>资源</th></tr></thead><tbody></tbody></table>
-<h2>时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());const fill=(id,rows,cols)=>{document.querySelector('#'+id+' tbody').innerHTML=rows.map(r=>'<tr>'+cols.map(c=>`<td>${r[c]??''}</td>`).join('')+'</tr>').join('')};fill('incidents',d.incidents,['code','vessel_name','status','sea_state','lead_org','version']);fill('assets',d.assets,['name','kind','status','range_km']);fill('areas',d.search_areas,['code','incident_id','status','priority','assigned_asset_id']);document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<h2>离线批次</h2><div id="batches"></div>
+<h2>时间线（按现场时间）</h2><ol id="timeline"></ol>
+<script>
+const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+async function resolve(id,decision){
+  const note=prompt(decision==='apply'?'确认强制应用该冲突操作？裁决备注：':'放弃该现场操作？裁决备注：')??'';
+  if(note===null)return;
+  await fetch('/api/offline/resolve',{method:'POST',headers:{'Content-Type':'application/json','X-User':'web-coord','X-Role':'coordinator'},body:JSON.stringify({client_event_id:id,decision,note})});
+  load();
+}
+function renderBatch(b){
+  const s=b.summary||{};
+  const events=(s.events||[]).map(e=>{
+    const reason=e.error?`<div class="meta">${esc(e.error)}</div>`:'';
+    const idem=e.idempotent?'<span class="meta">幂等命中</span>':'';
+    const actions=e.status==='conflict'
+      ?`<div style="margin-top:4px"><button class="apply" onclick="resolve('${esc(e.client_event_id)}','apply')">应用</button><button class="discard" onclick="resolve('${esc(e.client_event_id)}','discard')">放弃</button></div>`:'';
+    return `<tr><td><span class="tag ${e.status}">${({merged:'已生效',conflict:'待裁决',rejected:'已拒绝',discarded:'已放弃'})[e.status]||e.status}</span></td>
+      <td>${esc(e.type)}</td><td>${esc(e.client_event_id)}</td><td class="meta">${esc(e.occurred_at)||'—'}</td><td>${idem}${reason}${actions}</td></tr>`;
+  }).join('');
+  return `<div class="batch ${b.status}">
+    <b>${esc(b.client_batch_id)}</b> <span class="tag ${b.status}">${b.status==='conflict'?'有待裁决':'已生效'}</span>
+    <span class="meta">提交人 ${esc(b.actor)} · 接收 ${esc(b.received_at)}</span>
+    <div class="meta">已生效 ${s.accepted??0} 项 · 待裁决 ${s.conflicts??0} 项 · 已拒绝 ${s.rejected??0} 项（按现场时间排序）</div>
+    <table style="margin-top:8px"><thead><tr><th>结果</th><th>类型</th><th>事件号</th><th>现场时间</th><th>说明 / 裁决</th></tr></thead><tbody>${events}</tbody></table>
+  </div>`;
+}
+async function load(){
+  const d=await fetch('/api/state').then(r=>r.json());
+  const fill=(id,rows,cols)=>{document.querySelector('#'+id+' tbody').innerHTML=rows.map(r=>'<tr>'+cols.map(c=>`<td>${esc(r[c])}</td>`).join('')+'</tr>').join('')};
+  fill('incidents',d.incidents,['code','vessel_name','status','sea_state','lead_org','version']);
+  fill('assets',d.assets,['name','kind','status','range_km','version']);
+  fill('areas',d.search_areas,['code','incident_id','status','priority','assigned_asset_id']);
+  document.querySelector('#batches').innerHTML=(d.offline_batches||[]).map(renderBatch).join('')||'<p class="meta">暂无离线批次</p>';
+  document.querySelector('#timeline').innerHTML=d.timeline.map(x=>`<li>${esc(x.occurred_at||x.created_at)} ${esc(x.action)} ${esc(x.details)}</li>`).join('');
+}
+load();setInterval(load,10000);
+</script></html>
